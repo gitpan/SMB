@@ -44,6 +44,8 @@ t/0-use.t
 t/1-parser.t
 t/2-packer.t
 t/3-nttime.t
+t/auth.t
+t/crypt.t
 t/file-find.t
 t/file-opens.t
 META.yml                                 Module YAML meta-data (added by MakeMaker)
