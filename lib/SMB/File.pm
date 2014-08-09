@@ -22,7 +22,7 @@ use parent 'SMB';
 
 use Time::HiRes qw(stat);
 use File::Basename qw(basename);
-use File::Glob qw(:bsd_glob);
+use File::Glob qw(bsd_glob GLOB_NOCASE GLOB_BRACE);
 use Fcntl qw(:mode O_DIRECTORY O_RDONLY O_RDWR O_CREAT O_EXCL O_TRUNC);
 use POSIX qw(strftime);
 
@@ -74,7 +74,7 @@ sub to_ntattr ($) {
 	return 0
 		| (S_ISREG($mode) ? ATTR_NORMAL    : 0)
 		| (S_ISDIR($mode) ? ATTR_DIRECTORY : 0)
-		| (S_ISBLK($mode) ? ATTR_DEVICE    : 0)
+#		| (S_ISBLK($mode) ? ATTR_DEVICE    : 0)
 		| (S_ISCHR($mode) ? ATTR_DEVICE    : 0)
 		| ($mode & S_IWUSR ? 0 : ATTR_READONLY)
 		;
@@ -88,7 +88,7 @@ sub new ($%) {
 	$name =~ s!\\!\/!g;
 	$name =~ s!/{2,}!/!g;
 	$name =~ s!/$!!;
-	my $root = $options{share_root};
+	my $root = $options{share_root} //= undef;
 	my $filename = undef;
 	if ($root) {
 		die "No share_root directory ($root)" unless -d $root;
@@ -97,7 +97,9 @@ sub new ($%) {
 		$filename =~ s!/{2,}!/!g;
 		$filename = '.' if $filename eq '';
 	}
-	my @stat = $filename && -e $filename ? stat($filename) : ();
+	my $is_ipc = $options{is_ipc} ||= 0;
+	my @stat = !$is_ipc && $filename && -e $filename ? stat($filename) : ();
+	my $is_srv = $is_ipc && $name =~ /^(?:srvsvc|wkssvc)$/;
 
 	my $self = $class->SUPER::new(
 		name             => $name,
@@ -106,10 +108,10 @@ sub new ($%) {
 		last_access_time => @stat ? to_nttime($stat[ 8])  : 0,
 		last_write_time  => @stat ? to_nttime($stat[ 9])  : 0,
 		change_time      => @stat ? to_nttime($stat[ 9])  : 0,
-		allocation_size  => @stat ? $stat[11] * $stat[12] : 0,
+		allocation_size  => @stat ? ($stat[12] || 0) * 512: 0,
 		end_of_file      => @stat ? $stat[ 7]             : 0,
 		attributes       => @stat ? to_ntattr($stat[ 2])  : 0,
-		exists           => @stat ? 1 : 0,
+		exists           => @stat || $is_srv ? 1 : 0,
 		opens            => 0,
 		%options,
 	);
@@ -137,7 +139,7 @@ sub update ($$$$$$$$;$) {
 sub is_directory ($) {
 	my $self = shift;
 
-	return $self->attributes & ATTR_DIRECTORY ? 1 : 0;
+	return $self->is_ipc ? 0 : $self->attributes & ATTR_DIRECTORY ? 1 : 0;
 }
 
 sub to_string ($;$) {
@@ -173,7 +175,8 @@ sub delete_openfile ($$) {
 	my $self = shift;
 	my $openfile = shift;
 
-	close($openfile->handle);
+	close($openfile->handle)
+		if $openfile->handle;
 
 	--$self->{opens};
 }
@@ -233,8 +236,13 @@ sub create ($) {
 sub overwrite ($) {
 	my $self = shift;
 
-	sysopen(my $fh, $self->filename, from_ntattr($self->attributes) | O_TRUNC)
+	# no idea why O_TRUNC fails on Windows
+	my $mode = $^O eq 'MSWin32' ? 0 : O_TRUNC;
+
+	sysopen(my $fh, $self->filename, from_ntattr($self->attributes) | $mode)
 		or return $self->_fail_exists(0);
+
+	truncate($fh, 0) if $^O eq 'MSWin32';
 
 	$self->add_openfile($fh, ACTION_OVERWRITTEN);
 }
@@ -254,6 +262,9 @@ sub overwrite_if ($) {
 sub open_by_disposition ($$) {
 	my $self = shift;
 	my $disposition = shift;
+
+	return $self->add_openfile(ACTION_OPENED, undef)
+		if $self->is_ipc;
 
 	return $self->supersede    if $disposition == DISPOSITION_SUPERSEDE;
 	return $self->open         if $disposition == DISPOSITION_OPEN;

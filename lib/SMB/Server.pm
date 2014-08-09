@@ -81,6 +81,10 @@ sub on_connect ($$) {
 	my $connection = shift;
 
 	# intended to be overriden in sub-classes
+
+	my $auth = $connection->auth;
+	$auth->load_user_passwords_from_file("$FindBin::Bin/../conf/passwd.txt")
+		or $auth->user_passwords({ test => '12345' });
 }
 
 sub on_disconnect ($$) {
@@ -136,6 +140,10 @@ sub on_command ($$$) {
 			$connection->auth->process_spnego($command->security_buffer);
 			$command->security_buffer($connection->auth->generate_spnego);
 			$command->header->uid($connection->id);
+			my $auth_completed = $connection->auth->auth_completed;
+			$error = SMB::STATUS_LOGON_FAILURE
+				if !$command->security_buffer
+				|| defined $auth_completed && !$auth_completed;
 		}
 		elsif ($command->is('TreeConnect')) {
 			my ($addr, $share) = $self->parse_share_uri($command->verify_uri);
@@ -148,7 +156,11 @@ sub on_command ($$$) {
 			}
 		}
 		elsif ($command->is('Create')) {
-			my $file = SMB::File->new(name => $command->file_name, share_root => $tree->root);
+			my $file = SMB::File->new(
+				name => $command->file_name,
+				share_root => $tree->root,
+				is_ipc => $tree->is_ipc,
+			);
 			my $disposition = $command->disposition;
 			if ($file->exists && $disposition == SMB::File::DISPOSITION_OPEN) {
 				if ($command->requested_directory && !$file->is_directory) {

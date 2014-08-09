@@ -86,14 +86,27 @@ sub new ($) {
 		server_dns_domain     => undef,
 		server_timestamp      => undef,
 		client_challenge      => undef,
+		lm_response           => undef,
+		ntlm_response         => undef,
 		domain                => undef,
 		host                  => undef,
 		username              => undef,
 		session_key           => undef,
 		auth_completed        => undef,
+		user_passwords        => {},
 		parser => SMB::Parser->new,
 		packer => SMB::Packer->new,
 	);
+}
+
+sub set_user_passwords ($$) {
+	my $self = shift;
+	my $user_passwords = shift || die "No user passwords to set";
+
+	die "User passwords should be HASH"
+		unless ref($user_passwords) eq 'HASH';
+
+	$self->user_passwords($user_passwords);
 }
 
 sub create_lm_hash ($) {
@@ -147,6 +160,67 @@ sub create_ntlmv2_response ($$$$;$) {
 	return hmac_md5($server_challenge . $client_challenge, $ntlmv2_hash) . $client_challenge;
 }
 
+sub get_user_passwd_line ($$) {
+	my $username = shift;
+	my $password = shift;
+
+	return "$username:" . join('',
+		map { map { sprintf "%02x", ord($_) } split '', $_ }
+		create_lm_hash($password), create_ntlm_hash($password)
+	);
+}
+
+sub load_user_passwords_from_file ($$) {
+	my $self = shift;
+	my $filename = shift || die "No passwd file";
+
+	open PASSWD, "<$filename" or return 0;
+	my @lines = <PASSWD>;
+	close PASSWD or return 0;
+
+	my %user_passwords = map {
+		s/^\s+//;
+		s/\s+$//;
+		my ($username, $hash_str) = split ':', $_;
+		my @hash_bytes = ($hash_str || '') =~ /^[0-9a-f]{64}$/
+			? map { chr(hex(substr($hash_str, $_ * 2, 2))) } 0 .. 31
+			: ();
+		$username && $username =~ /^\w[\w.+-]*$/ && @hash_bytes
+			? ($username => [ join('', @hash_bytes[0 .. 15]), join('', @hash_bytes[16 .. 31]) ])
+			: ();
+	} grep !/^\s*#/, @lines;
+
+	return 0 unless %user_passwords;
+
+	$self->user_passwords(\%user_passwords);
+
+	return 1;
+}
+
+sub is_user_authenticated ($) {
+	my $self = shift;
+
+#	my $lm_response   = $self->lm_response   || return $self->err("No lm_response from client");
+	my $ntlm_response = $self->ntlm_response || return $self->err("No ntlm_response from client");
+
+	my ($hmac, $client_data) = $ntlm_response =~ /^(.{16})(.+)$/s;
+	return $self->err("Invalid short ntlm_response from client")
+		unless $hmac;
+
+	my $username = $self->username // return $self->err("No username from client");
+	my $password = $self->user_passwords->{$username} // return $self->err("No user '$username' on server");
+	my ($lm_hash, $ntlm_hash) = ref($password) eq 'ARRAY' ? @$password : ();
+
+#	$lm_hash   ||= create_lm_hash($password);
+	$ntlm_hash ||= create_ntlm_hash($password);
+	my $ntlmv2_hash = create_ntlmv2_hash($ntlm_hash, $username, $self->client_domain);
+
+	return $self->err("Failed password check for user '$username', client not authenticated")
+		unless $hmac eq hmac_md5($self->server_challenge . $client_data, $ntlmv2_hash);
+
+	return 1;
+}
+
 my @parsed_context_values;
 
 sub parse_asn1 {
@@ -159,7 +233,7 @@ sub parse_asn1 {
 		my $factor = 1;
 		$len = 0;
 		for (1 .. $llen) {
-			$len += $factor * ord(shift @$bytes);
+			$len = $len * $factor + ord(shift @$bytes);
 			$factor *= 256;
 		}
 	}
@@ -184,7 +258,7 @@ sub parse_asn1 {
 	} elsif ($tag == ASN1_SEQUENCE || $tag == ASN1_APPLICATION) {
 		push @contents, parse_asn1(\@bytes)
 			while @bytes;
-	} elsif ($tag >= ASN1_CONTEXT && $tag <= ASN1_CONTEXT + 2) {
+	} elsif ($tag >= ASN1_CONTEXT && $tag <= ASN1_CONTEXT + 3) {
 		@contents = @{parse_asn1(\@bytes)};
 		$parsed_context_values[$tag - ASN1_CONTEXT] //= \@contents;
 	} else {
@@ -220,7 +294,7 @@ sub generate_asn1 {
 			push @bytes, @{generate_asn1(@$content)};
 			$content = shift;
 		} while $content;
-	} elsif ($tag >= ASN1_CONTEXT && $tag <= ASN1_CONTEXT + 2) {
+	} elsif ($tag >= ASN1_CONTEXT && $tag <= ASN1_CONTEXT + 3) {
 		@bytes = @{generate_asn1($content, @_)};
 	} else {
 		warn sprintf "Unsupported asn1 tag 0x%x on generate\n", $tag;
@@ -239,13 +313,14 @@ sub generate_asn1 {
 
 sub process_spnego ($$%) {
 	my $self = shift;
-	my $bytes = shift || return;
+	my $buffer = shift // return;
 	my %options = @_;
 
-	return unless @$bytes > 2;
+	my @bytes = split '', $buffer;
+	return unless @bytes > 2;
 
 	@parsed_context_values = ();
-	my $struct = parse_asn1($bytes);
+	my $struct = parse_asn1(\@bytes);
 	return unless $struct;
 
 	if (!defined $self->ntlmssp_supported || $options{is_initial}) {
@@ -280,14 +355,14 @@ sub process_spnego ($$%) {
 		my $off1 = $parser->skip(2)->uint32;
 		my $len2 = $parser->uint16;
 		my $off2 = $parser->skip(2)->uint32;
-		$self->client_domain(scalar $parser->reset($off1)->bytes($len1));
-		$self->client_host  (scalar $parser->reset($off2)->bytes($len2));
+		$self->client_domain($parser->reset($off1)->bytes($len1));
+		$self->client_host  ($parser->reset($off2)->bytes($len2));
 	} elsif (!defined $self->server_challenge) {
 		return $self->err("No expected NTLMSSP_CHALLENGE")
 			unless $parser->uint32 == NTLMSSP_CHALLENGE;
 		my $len1 = $parser->uint16;
 		my $off1 = $parser->skip(2)->uint32;
-		$self->server_challenge(scalar $parser->reset(24)->bytes(8));
+		$self->server_challenge($parser->reset(24)->bytes(8));
 		$self->server_host($parser->reset($off1)->str($len1));
 		my $itemtype;
 		do {{
@@ -307,7 +382,8 @@ sub process_spnego ($$%) {
 	} elsif (!defined $self->client_challenge) {
 		return $self->err("No expected NTLMSSP_AUTH")
 			unless $parser->uint32 == NTLMSSP_AUTH;
-		$parser->skip(8);  # skip lm desc
+		my $llen = $parser->uint16;
+		my $loff = $parser->skip(2)->uint32;
 		my $nlen = $parser->uint16;
 		my $noff = $parser->skip(2)->uint32;
 		my $len1 = $parser->uint16;
@@ -316,10 +392,12 @@ sub process_spnego ($$%) {
 		my $off2 = $parser->skip(2)->uint32;
 		my $len3 = $parser->uint16;
 		my $off3 = $parser->skip(2)->uint32;
-		$self->client_challenge(scalar $parser->reset($noff + 28)->bytes(8));
+		$self->client_challenge($parser->reset($noff + 28)->bytes(8));
+		$self->lm_response  ($parser->reset($loff)->bytes($llen));
+		$self->ntlm_response($parser->reset($noff)->bytes($nlen));
 		$self->client_domain($parser->reset($off1)->str($len1));
-		$self->client_host  ($parser->reset($off2)->str($len2));
-		$self->username     ($parser->reset($off3)->str($len2));
+		$self->username     ($parser->reset($off2)->str($len2));
+		$self->client_host  ($parser->reset($off3)->str($len3));
 	} elsif (!defined $self->auth_completed) {
 		my $value = $parsed_context_values[0];
 		return $self->err("No expected spnego context value (ACCEPT_COMPLETED)")
@@ -423,7 +501,7 @@ sub generate_spnego ($%) {
 			->str($self->server_dns_host)
 			->uint16(NTLMSSP_ITEM_TIMESTAMP)
 			->uint16(8)
-			->bytes([ "\0" x 8 ])
+			->bytes("\0" x 8)
 			->uint16(NTLMSSP_ITEM_TERMINATOR)
 			->uint16(0)
 		;
@@ -473,9 +551,13 @@ sub generate_spnego ($%) {
 
 		my $client_data = $self->packer->data;
 		my $hmac = hmac_md5($self->server_challenge . $client_data, $ntlmv2_hash);
+		my $ntlm_response = "$hmac$client_data";
 		my $nlen = 16 + $self->packer->size;  # hmac + client data
 
 		my $lm_response = create_lmv2_response($ntlm_hash, $username, $domain, $self->server_challenge);
+
+		$self->lm_response($lm_response);
+		$self->ntlm_response($ntlm_response);
 
 		$self->packer->reset
 			->bytes(NTLMSSP_ID_STR)
@@ -500,8 +582,7 @@ sub generate_spnego ($%) {
 			->uint32(88 + $nlen + length("$domain$username$host") * 2)
 			->uint32(NTLMSSP_FLAGS_CLIENT)
 			->bytes($lm_response)
-			->bytes($hmac)
-			->bytes($client_data)
+			->bytes($ntlm_response)
 			->str($domain)
 			->str($username)
 			->str($host)
@@ -512,10 +593,10 @@ sub generate_spnego ($%) {
 			[ ASN1_CONTEXT + 2, ASN1_BINARY, $self->packer->data ],
 		];
 	} elsif (!defined $self->auth_completed) {
-		$self->auth_completed(1);
+		$self->auth_completed($self->is_user_authenticated ? 1 : 0);
 		$struct = [ ASN1_CONTEXT + 1, ASN1_SEQUENCE,
 			[ ASN1_CONTEXT, ASN1_ENUMERATED, SPNEGO_ACCEPT_COMPLETED ],
-		];
+		] if $self->auth_completed;
 	} else {
 		$self->err("generate_spnego called after auth_completed");
 	}
@@ -523,7 +604,7 @@ sub generate_spnego ($%) {
 RETURN:
 	return undef unless $struct;
 
-	return generate_asn1(@$struct);
+	return join '', @{generate_asn1(@$struct)};
 }
 
 1;

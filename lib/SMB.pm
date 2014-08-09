@@ -18,7 +18,7 @@ package SMB;
 use strict;
 use warnings;
 
-our $VERSION = 0.03;
+our $VERSION = 0.04;
 
 use constant {
 	STATUS_SUCCESS                  => 0x00000000,
@@ -41,6 +41,7 @@ use constant {
 	STATUS_SHARING_VIOLATION        => 0xc0000043,
 	STATUS_DELETE_PENDING           => 0xc0000056,
 	STATUS_PRIVILEGE_NOT_HELD       => 0xc0000061,
+	STATUS_LOGON_FAILURE            => 0xc000006d,
 	STATUS_DISK_FULL                => 0xc000007f,
 	STATUS_FILE_IS_A_DIRECTORY      => 0xc00000ba,
 	STATUS_BAD_NETWORK_NAME         => 0xc00000cc,
@@ -85,6 +86,11 @@ sub mem ($$;$) {
 	my $data = shift;
 	my $label = shift || "Data dump";
 	return if $self->disable_log;
+
+	if (!defined $data) {
+		$self->msg("$label (undef)");
+		return;
+	}
 
 	my $len = length($data);
 	$self->msg(sprintf("%s (%lu bytes%s):", $label, $len, $len > $MAX_DUMP_BYTES ? ", shorten" : ""), @_);
