@@ -29,4 +29,4 @@ requires:
   Sys::Hostname: '0'
   Time::HiRes: '0'
   perl: '5.01'
-version: '0.04'
+version: '0.05'
