@@ -32,7 +32,6 @@
       },
       "runtime" : {
          "requires" : {
-            "Digest::HMAC_MD5" : "0",
             "Exporter" : "0",
             "Fcntl" : "0",
             "File::Basename" : "0",
@@ -47,5 +46,5 @@
       }
    },
    "release_status" : "stable",
-   "version" : "0.05"
+   "version" : "0.06"
 }

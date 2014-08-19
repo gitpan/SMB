@@ -27,6 +27,8 @@ use SMB::v2::Command::TreeConnect;
 use SMB::v2::Command::Create;
 use SMB::v2::Command::Close;
 use SMB::v2::Command::QueryDirectory;
+use SMB::v2::Command::Read;
+use SMB::v2::Command::Write;
 use SMB::Tree;
 
 sub new ($$%) {
@@ -260,6 +262,15 @@ sub _normalize_path ($$;$) {
 	return $path;
 }
 
+sub _basename ($;$) {
+	my $path = shift // '';
+	my $is_dos = shift || 0;
+
+	my $delim = $is_dos ? '\\' : '/';
+
+	return $path =~ /.*\Q$delim\E(.*)/ ? $1 : $path;
+}
+
 sub perform_tree_command ($$$@) {
 	my $self = shift;
 	my $tree = shift;
@@ -275,6 +286,7 @@ sub perform_tree_command ($$$@) {
 		my $pattern = _normalize_path(shift || "*", $tree->cwd, 1);
 		my $dirname = $pattern =~ /^(.*)\\(.*)/ ? $1 : "";
 		$pattern = $2 if $2;
+
 		my $response = $self->process_request($connection, 'Create',
 			file_name => $dirname,
 			file_attributes => SMB::File::ATTR_DIRECTORY,
@@ -289,11 +301,102 @@ sub perform_tree_command ($$$@) {
 		$self->process_request($connection, 'Close',
 			fid => $fid,
 		);
+
 		return wantarray ? @$files : $files;
-	} elsif ($command eq 'remove') {
-		my $filename = shift // return;
-		return if $filename eq '';
+	} elsif ($command eq 'dnload') {
+		my $filename = shift // '';
+		return $self->err("No filename") if $filename eq '';
 		$filename = _normalize_path($filename, $tree->cwd, 1);
+		my $dst_filename = _normalize_path(shift || _basename($filename, 1), '.');
+
+		my $response = $self->process_request($connection, 'Create',
+			file_name => $filename,
+		);
+		return unless $response && $response->is_success;
+		my $file = $response->openfile->file;
+		my $fid = $response->fid;
+		my $remaining = $file->end_of_file;
+		my $time = $file->mtime;
+		my $content = '';
+		my $offset = 0;
+		while ($remaining) {
+			my $length = $remaining >= 65536 ? 65536 : $remaining;
+			$remaining -= $length;
+			$response = $self->process_request($connection, 'Read',
+				fid => $fid,
+				offset => $offset,
+				length => $length,
+				remaining_bytes => $remaining,
+			);
+			return unless $response && $response->is_success;
+			my $read = $response->length;
+			return $self->err("Unexpected $read bytes read instead of $length at offset $offset")
+				if $read != $length;
+			$content .= $response->buffer;
+			$offset += $length;
+		}
+		$self->process_request($connection, 'Close',
+			fid => $fid,
+		);
+
+		open DST, '>', $dst_filename
+			or return $self->err("Can't open $dst_filename for write: $!");
+		print DST $content
+			or return $self->err("Can't write content to $dst_filename: $!");
+		close DST
+			or return $self->err("Can't close $dst_filename after write: $!");
+
+		# consider to set $time on file
+		return 1;
+	} elsif ($command eq 'upload') {
+		my $filename = shift // '';
+		return $self->err("No filename") if $filename eq '';
+		$filename = _normalize_path($filename, '.');
+		my $dst_filename = _normalize_path(shift || _basename($filename), $tree->cwd, 1);
+
+		local $/ = undef;
+		open SRC, '<', $filename
+			or return $self->err("Can't open $filename for read: $!");
+		my $content = <SRC>
+			// return $self->err("Can't read content from $filename: $!");
+		close SRC
+			or return $self->err("Can't close $filename after read: $!");
+
+		my $response = $self->process_request($connection, 'Create',
+			file_name => $dst_filename,
+			options => SMB::v2::Command::Create::OPTIONS_NON_DIRECTORY_FILE,
+			access_mask => 0x12019f,
+			disposition => SMB::File::DISPOSITION_OVERWRITE_IF,
+		);
+		return unless $response && $response->is_success;
+		my $fid = $response->fid;
+		my $remaining = length($content);
+		my $offset = 0;
+		while ($remaining) {
+			my $length = $remaining >= 65536 ? 65536 : $remaining;
+			$remaining -= $length;
+			$response = $self->process_request($connection, 'Write',
+				fid => $fid,
+				offset => $offset,
+				remaining_bytes => $remaining,
+				buffer => substr($content, $offset, $length),
+			);
+			return unless $response && $response->is_success;
+			my $written = $response->length;
+			return $self->err("Unexpected $written bytes written instead of $length at offset $offset")
+				if $written != $length;
+			$offset += $length;
+		}
+		$self->process_request($connection, 'Close',
+			fid => $fid,
+		);
+
+		return 1;
+	} elsif ($command eq 'remove') {
+		my $filename = shift // '';
+		return $self->err("No filename") if $filename eq '';
+		$filename = _normalize_path($filename, $tree->cwd, 1);
+
 		my $is_dir = shift || 0;
 		my $options = ($is_dir
 			? SMB::v2::Command::Create::OPTIONS_DIRECTORY_FILE
@@ -310,6 +413,7 @@ sub perform_tree_command ($$$@) {
 			fid => $fid,
 		);
 		return unless $response && $response->is_success;
+
 		return 1;
 	}
 
